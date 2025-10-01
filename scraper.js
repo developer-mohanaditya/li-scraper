@@ -26,18 +26,34 @@ const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 const nowISO = () => new Date().toISOString();
 const tsForFile = () => new Date().toISOString().replace(/[:.]/g, '-');
 
-// Default-on normalization (fixes bullets/quotes/mojibake in plain text)
+// ✅ Default-on normalization with wider mojibake map
 function normalizeText(s = '') {
-  return String(s)
-    .replace(/\u00A0|┬á|Â/g, ' ')
-    .replace(/ÔÇÖ/g, "'").replace(/\u2019/g, "'")
-    .replace(/ÔÇ£|ÔÇØ/g, '"').replace(/\u201C|\u201D/g, '"')
-    .replace(/ÔÇó/g, '•')
-    .replace(/[\u2013\u2014]/g, '-')
-    .replace(/\u2026/g, '...')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  let t = String(s);
+
+  // Remove soft hyphen & non-breaking spaces
+  t = t.replace(/\u00AD/g, '').replace(/\u00A0|Â|Ã¯|Ã»|Ã/g, ' ');
+
+  // Common UTF-8→cp1252 mojibake (â…, â€™, â€œ, â€” etc.)
+  const map = [
+    [/â€™/g, '’'], [/â€˜/g, '‘'],
+    [/â€œ/g, '“'], [/â€�/g, '”'],
+    [/â€“/g, '–'], [/â€”/g, '—'],
+    [/â€¢/g, '•'], [/â€¦/g, '…'],
+    [/â€¢/g, '•'], [/â„¢/g, '™'],
+    // Double-decoded set (ÔÇ… patterns)
+    [/ÔÇÖ/g, '’'], [/ÔÇÿ/g, '‘'],
+    [/ÔÇ£/g, '“'], [/ÔÇØ/g, '”'],
+    [/ÔÇô/g, '–'], [/ÔÇö/g, '—'],
+    [/ÔÇó/g, '•'], [/ÔÇª/g, '…'],
+    // Stray artifacts
+    [/Â·/g, '•'], [/Â«/g, '«'], [/Â»/g, '»'],
+    [/Â°/g, '°'], [/Â©/g, '©'], [/Â®/g, '®'],
+  ];
+  for (const [re, rep] of map) t = t.replace(re, rep);
+
+  // Collapse excessive whitespace
+  t = t.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').replace(/[ \u00A0]{2,}/g, ' ').trim();
+  return t;
 }
 
 function parseKM(str) {
@@ -51,7 +67,6 @@ function parseKM(str) {
   return Math.round(n);
 }
 
-// Parse "likes/comments" from guest-visible summary like "523 Reactions | 288 Comments"
 function parseCounts(countsRaw) {
   const out = { likes: null, comments_count: null };
   if (!countsRaw) return out;
@@ -85,6 +100,7 @@ const AUTHWALL_DIALOG_SEL = [
   '#authwall-sign-in',
   '#authwall-join',
   '[data-test-id="authwall"]',
+  '[data-test-id*="contextual-sign-in"]'
 ].join(',');
 
 const AUTHWALL_DISMISS_BTNS = [
@@ -102,6 +118,14 @@ async function isAuthwallPresent(page) {
   } catch { return false; }
 }
 
+async function forceRemoveAuthwallDOM(page) {
+  await page.evaluate((SEL) => {
+    const nodes = document.querySelectorAll(SEL + ', .artdeco-modal-overlay, [data-test-id*="authwall"], [data-test-id*="modal"]');
+    nodes.forEach(n => n.remove());
+    document.body.style.overflow = '';
+  }, AUTHWALL_DIALOG_SEL);
+}
+
 async function dismissAuthwall(page) {
   let dismissed = false;
   for (const sel of AUTHWALL_DISMISS_BTNS) {
@@ -116,6 +140,7 @@ async function dismissAuthwall(page) {
   if (!dismissed) {
     try { await page.mouse.click(10, 10); dismissed = true; console.log('[AUTHWALL] Clicked backdrop'); } catch {}
   }
+  await forceRemoveAuthwallDOM(page); // hard remove if still present
   await page.waitForTimeout(300);
   return dismissed;
 }
@@ -156,9 +181,8 @@ async function expandPostText(page) {
   }
 }
 
-// Guest pages: avoid “see more comments” that forces login.
-// Strategy: deep scroll + guard; target many containers so we can sort by engagement.
-async function expandComments(page, target = 60, maxLoops = 14) {
+// Guest pages: avoid login-gated “see more comments”. Scroll deep + guard.
+async function expandComments(page, target = 80, maxLoops = 14) {
   console.log('[INFO] Scrolling to load as many comments as possible… target=%d', target);
   for (let i = 0; i < maxLoops; i++) {
     await ensureNoAuthwall(page);
@@ -167,6 +191,9 @@ async function expandComments(page, target = 60, maxLoops = 14) {
     const count = await page.locator(selectors.commentItemCandidates.join(',')).count().catch(() => 0);
     console.log(`[DEBUG] Visible comment containers: ${count}`);
     if (count >= target) break;
+    // Stop if we hit a guest CTA near the footer
+    const cta = await page.locator('a[href*="signin"], a[href*="login"], a[href*="join"]').count().catch(() => 0);
+    if (cta > 0 && count >= 10) { console.log('[INFO] Reached guest CTA; stopping scroll.'); break; }
   }
 }
 
@@ -263,14 +290,14 @@ async function extractComments(page) {
     const norm = s => (s || '').replace(/\u00A0/g, ' ').trim();
 
     function grabRepliesCount(el) {
-      // Look for text like "3 Replies" / "1 Reply" anywhere inside the comment footer
+      // Look for "3 Replies" / "1 Reply" anywhere inside the comment block
       const txt = norm(el.innerText || '');
-      const m = txt.match(/(\d+(?:\.\d+)?)[\s\u00A0]*(?:Replies?|repl(?:y|ies))/);
+      const m = txt.match(/(\d+(?:\.\d+)?)[\s\u00A0]*(Replies?|Reply|repl(?:y|ies))/i);
       if (!m) return 0;
       const raw = m[1];
-      const s = raw.toUpperCase();
-      if (s.endsWith('K')) return Math.round(parseFloat(s) * 1_000);
-      if (s.endsWith('M')) return Math.round(parseFloat(s) * 1_000_000);
+      const S = raw.toUpperCase();
+      if (S.endsWith('K')) return Math.round(parseFloat(S) * 1_000);
+      if (S.endsWith('M')) return Math.round(parseFloat(S) * 1_000_000);
       return Number(raw.replace(/[^\d.]/g, '')) || 0;
     }
 
@@ -312,7 +339,7 @@ async function extractComments(page) {
 
       // id (best-effort)
       const urnAttr = el.querySelector('[data-semaphore-content-urn]')?.getAttribute('data-semaphore-content-urn') || '';
-      const urnMatch = urnAttr.match(/comment:\(([^,]+),(\d+)\)/);
+      const urnMatch = urnAttr && urnAttr.match(/comment:\(([^,]+),(\d+)\)/);
       const comment_id = urnMatch ? urnMatch[2] : `auto-${idx}`;
 
       items.push({
@@ -351,7 +378,7 @@ async function extractComments(page) {
     await ensureNoAuthwall(page);
 
     await expandPostText(page);
-    await expandComments(page); // loads *many* comments so we can sort
+    await expandComments(page); // load many comments so we can sort
 
     // Extract
     const post = await extractPost(page);
@@ -364,7 +391,7 @@ async function extractComments(page) {
     // Parse counts into numbers (best-effort guest parsing)
     const counts = parseCounts(post.counts_raw);
 
-    // Build + normalize comments; compute engagement = likes + 2*replies
+    // Build + normalize + score comments
     const commentsAll = rawComments.map((c) => {
       const likes = parseKM(c.likes_text);
       const replies = Number(c.replies_hint || 0);
@@ -394,7 +421,7 @@ async function extractComments(page) {
         author_name: normalizeText(post.author_name),
         author_handle: post.author_handle || '',
         posted_at: post.posted_at || '',
-        post_text: normalizeText(post.post_text || ''),     // ✅ normalization ON by default
+        post_text: normalizeText(post.post_text || ''),   // ✅ normalization ON
         post_html: post.post_html || '',
         impressions: post.impressions,
         likes: counts.likes ?? post.likes,
@@ -404,8 +431,8 @@ async function extractComments(page) {
       },
       comments,
       meta: {
-        note: 'Public DOM scrape (no login). Selectors heuristic. Authwall guarded. Sorted by engagement.',
-        version: 'dom-public-v4',
+        note: 'Public DOM scrape (no login). Authwall guarded & removed. Text normalized. Sorted by engagement.',
+        version: 'dom-public-v5',
         scraped_at: nowISO(),
       }
     };
