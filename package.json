@@ -1,0 +1,9 @@
+{
+  "name": "li-scraper",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {},
+  "dependencies": {
+    "playwright": "^1.55.1"
+  }
+}

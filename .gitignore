@@ -1,0 +1,9 @@
+# Ignore everything by default
+*
+
+# Allow specific files to be tracked
+!package.json
+!scraper.js
+!selectors.js
+!.gitignore
+!.gitattributes
